@@ -22,13 +22,13 @@
 - 不碰音频流，全程在文本态工作，不需要任何音频权限；
 - 换成任意 OpenAI 兼容模型，提示词随你写；
 - 外卖、快递、推销、客服、联系人、陌生号分别配置，每类可单独关掉（关掉就是原生小米回复）；
-- **语音、字幕、通话记录三者文本一致**（这是 7.13 适配的关键难点，见下文）。
+- **语音、字幕、通话记录三者文本一致**（这是 ai通话（6.1.6） 适配的关键难点，见下文）。
 
 ---
 
-## 为什么原版在旧版超级小爱7.13 上失效
+## 为什么原版项目在旧版超级小爱7.13 上失效
 
-原版 hook 的是一条叫 `osbot` 的通话引擎链，7.13 把它整个换掉了。
+原版 hook 的是一条叫 `osbot` 的通话引擎链，而旧版的ai通话不存在通话引擎链。
 
 **HyperOS系统新的ai通话引擎在超级小爱（8.2.70），而旧版的不在超级小爱，在ai通话（com.xiaomi.aiasst.service 6.1.6）里面**
 
@@ -44,7 +44,7 @@
 | Provider `ai-assist-call-config` | 改为 `com.xiaomi.aiasst.service.aicall.provider` |
 | 配置键 `ai_custom_opening_*` / `ai_call_reply_log_content` | ❌ 不存在 |
 
-7.13 是全新的**事件驱动 + 云端 NLP**架构，ASR / NLP / TTS 全部在 `com.xiaomi.aiasst.service`（`classes2.dex`）：
+旧版ai通话（6.1.6）是全新的**事件驱动 + 云端 NLP**架构，ASR / NLP / TTS 全部在 `com.xiaomi.aiasst.service`（`classes2.dex`）：
 
 ```
 process/asr/AsrManager            语音识别
@@ -109,7 +109,7 @@ incall/InCallAiServiceImpl        InCallService 实现
 
 人工接听的通话，点通话页右上角 AI 应答 → 选「小爱帮我回」。
 
-7.13 里没有原版的 `takeOverCallWithAi` 可 hook，但手动触发后对话回合**仍然会走 `doNlp`**，只是 `type` 标记为 `user_custom_query`。模块据此自动识别为「手动接管」，并豁免来电分类开关——用户主动点了按钮就是要 AI 接，不该被「骚扰电话走原生」这条规则挡回去。
+旧版ai通话（6.1.6） 里没有原版的 `takeOverCallWithAi` 可 hook，但手动触发后对话回合**仍然会走 `doNlp`**，只是 `type` 标记为 `user_custom_query`。模块据此自动识别为「手动接管」，并豁免来电分类开关——用户主动点了按钮就是要 AI 接，不该被「骚扰电话走原生」这条规则挡回去。
 
 **模型接入**
 
@@ -204,7 +204,7 @@ KS_PASS=aicallagent VERSION_NAME=1.9 VERSION_CODE=11 bash build.sh
 
 ### v1.8 — 字幕与语音同步、手动接管适配（本分支）
 
-针对 7.13 的两个体验缺陷：
+针对 ai通话 的两个体验缺陷：
 
 **1. 听到的和看到的不是同一句话**
 
@@ -214,12 +214,12 @@ KS_PASS=aicallagent VERSION_NAME=1.9 VERSION_CODE=11 bash build.sh
 
 **2. 手动「小爱帮我回」不走模型**
 
-7.13 没有 `takeOverCallWithAi`。改为识别 `doNlp` 的 `type == user_custom_query`（手动触发路径），自动豁免分类开关。
+ai通话 没有 `takeOverCallWithAi`。改为识别 `doNlp` 的 `type == user_custom_query`（手动触发路径），自动豁免分类开关。
 
-### v1.4 — 7.13 基础适配（本分支）
+### v1.4 — 基础适配（本分支）
 
 - 作用域 `com.miui.voiceassist` → `com.xiaomi.aiasst.service`
-- hook 点全部换成 7.13 的 `NlpManager.doNlp` / `TtsManager.buildTtsEvent`
+- hook 点全部换成 ai通话 的 `NlpManager.doNlp` / `TtsManager.buildTtsEvent`
 - 来电号码改从 `InCallAiServiceImpl.h()`（public static）取当前 `android.telecom.Call`
 - 配置读取通道白名单同步改为 `com.xiaomi.aiasst.service`
 - 保留原版全部功能：分类分流、分类提示词、通话记录、开场白、对话历史
@@ -236,8 +236,8 @@ KS_PASS=aicallagent VERSION_NAME=1.9 VERSION_CODE=11 bash build.sh
 ## 已知限制
 
 - **强依赖类名/方法名**。整套 hook 按名字反射定位，小爱升级后若改名、混淆或再次重构，模块会**静默失效**（日志里出现 `hook xxx 失败`）。目前没做方法签名兜底。
-- **版本绑定**。已适配 7.13.35.0012。其它 7.x 版本可能可用也可能失效，请以日志为准。
-- **手动接管靠类型推断**。7.13 没有显式的接管方法可 hook，靠 `user_custom_query` 识别；若某些手动路径用了别的 `type`，可能不会豁免分类开关。
+- **版本绑定**。已适配 ai通话（6.1.6）。其它版本可能可用也可能失效，请以日志为准。
+- **手动接管靠类型推断**。ai通话（6.1.6） 没有显式的接管方法可 hook，靠 `user_custom_query` 识别；若某些手动路径用了别的 `type`，可能不会豁免分类开关。
 - **黄页标签可能取不到**。日志里 `黄页=null` 时分类会退回通讯录 + 短号规则。外送/快递/推销识别不准时，请附上 `归类：` 日志反馈。
 - **只在文本态工作**。语音识别错误、方言、噪音，模块无能为力——它拿到的就是 ASR 的输出。
 - **强制思考的模型关不掉思考**。像 `deepseek-flash` 这类推理模型，即便开关关着、提示词要求直接作答，响应里仍会出现 `reasoning_content` 并占用 token 预算。正文一旦被挤空，这一轮会放行原生而不是念思考。要彻底避免请用 `deepseek-chat`、`qwen-plus` 等非推理模型。
@@ -278,7 +278,7 @@ AICallAgent/
 
 | 文件 | 改动 |
 |---|---|
-| `MainHook.java` | **完全重写**：hook 点换到 7.13 的类；新增字幕同步、号码获取、手动路径识别 |
+| `MainHook.java` | **完全重写**：hook 点换到 ai通话（6.1.6） 的类；新增字幕同步、号码获取、手动路径识别 |
 | `LogProvider.java` | `CALLER_PKG`：`com.miui.voiceassist` → `com.xiaomi.aiasst.service` |
 | `res/values/strings.xml` | `xposedscope` 改为 `com.xiaomi.aiasst.service` |
 | `build.sh` | 路径转换补上 `/e/` `/f/` 等盘符 |
