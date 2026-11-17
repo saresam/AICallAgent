@@ -1,14 +1,14 @@
-# AICallAgent · 超级小爱 7.13 AI 通话接管
+# AICallAgent · 超级小爱 AI 通话接管
 
 `io.github.cherry1jay.aicallagent`
 
 把小米「AI 通话」的大脑换成你自己的大模型。
 
-一个 **LSPosed 模块**：接管超级小爱（7.13）的 AI 自动接听，用任意 OpenAI 兼容接口（DeepSeek / Kimi / Qwen / GLM / Ollama / one-api 中转…）生成对话，并按来电类型分流——想接的走你的模型，不想接的交回小米原生话术。
+一个 **LSPosed 模块**：接管ai通话（6.1.6）的 AI 自动接听，用任意 OpenAI 兼容接口（DeepSeek / Kimi / Qwen / GLM / Ollama / one-api 中转…）生成对话，并按来电类型分流——想接的走你的模型，不想接的交回小米原生话术。
 
-> **本项目是 [AICallAgent](https://github.com/cherry1jay/AICallAgent) v1.4 的 7.13 适配分支。**
-> 原版针对小爱 **8.2.70**（`com.aios.osbot.*` 引擎），在 7.13 上是静默失效的——两代架构完全不同。
-> 本分支在 **Redmi K50 Ultra / HyperOS 2.0.215 / Android 15 / 超级小爱 7.13.35.0012** 上真机实测通过。
+> **本项目是 [AICallAgent](https://github.com/cherry1jay/AICallAgent) v1.4 的适配分支。**
+> 原版针对小爱 **8.2.70**（`com.aios.osbot.*` 引擎），在旧版上是静默失效的——两代架构完全不同。
+> 本分支在 **Redmi K50 Ultra / HyperOS 2.0.215 / Android 15 / ai通话6.1.6** 上真机实测通过。
 
 ---
 
@@ -26,11 +26,15 @@
 
 ---
 
-## 为什么原版在 7.13 上失效
+## 为什么原版在旧版超级小爱7.13 上失效
 
-原版 hook 的是一条叫 `osbot` 的通话引擎链，7.13 把它整个换掉了。实测比对：
+原版 hook 的是一条叫 `osbot` 的通话引擎链，7.13 把它整个换掉了。
 
-| 原版（8.2.70） | 7.13.35.0012 |
+**HyperOS系统新的ai通话引擎在超级小爱（8.2.70），而旧版的不在超级小爱，在ai通话（com.xiaomi.aiasst.service 6.1.6）里面**
+
+实测比对：
+
+| 原版（8.2.70） | 旧版ai通话（6.1.6） |
 |---|---|
 | 包名 `com.miui.voiceassist` | AI 通话引擎迁到 **`com.xiaomi.aiasst.service`** |
 | `com.aios.osbot.tools.phone.engine.CallConversationEngine` | ❌ 不存在（无 `osbot` 包） |
