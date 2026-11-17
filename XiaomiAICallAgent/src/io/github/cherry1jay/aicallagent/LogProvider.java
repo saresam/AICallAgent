@@ -20,8 +20,8 @@ public class LogProvider extends ContentProvider {
     static final String METHOD_DUMP = "dump";
     /** Hook 在小爱进程里没有我们的 data 目录权限，配置由本进程代读 */
     static final String METHOD_CONFIG = "config";
-    /** 唯一允许读取配置的调用方 */
-    static final String CALLER_PKG = "com.miui.voiceassist";
+    /** 唯一允许读取配置的调用方：7.13 上 Hook 跑在 AI 通话引擎进程 */
+    static final String CALLER_PKG = "com.xiaomi.aiasst.service";
 
     public static Uri uri() {
         return Uri.parse("content://" + AUTHORITY + "/");

@@ -95,7 +95,7 @@ sed -e "s/android:versionCode=\"[0-9]*\"/android:versionCode=\"$VERSION_CODE\"/"
 echo "==> 3/6 编译 Java"
 find "$PROJ/src" "$BUILD/gen" -name "*.java" > "$BUILD/sources.txt"
 if [ -n "$EXE" ]; then
-  sed -i "s|/c/|C:/|g; s|/d/|D:/|g" "$BUILD/sources.txt"
+  sed -i "s|/c/|C:/|g; s|/d/|D:/|g; s|/e/|E:/|g; s|/f/|F:/|g" "$BUILD/sources.txt"
 fi
 "$JAVAC" -encoding UTF-8 -source 11 -target 11 \
   -classpath "$(W "$PLATFORM");$(W "$XPAPI")" \
@@ -105,7 +105,7 @@ fi
 echo "==> 4/6 转 dex"
 find "$BUILD/classes" -name "*.class" > "$BUILD/classes.txt"
 if [ -n "$EXE" ]; then
-  sed -i "s|/c/|C:/|g; s|/d/|D:/|g" "$BUILD/classes.txt"
+  sed -i "s|/c/|C:/|g; s|/d/|D:/|g; s|/e/|E:/|g; s|/f/|F:/|g" "$BUILD/classes.txt"
 fi
 "$BT/d8$BAT" --release --lib "$(W "$PLATFORM")" --min-api 29 \
   --output "$(W "$BUILD/dex")" @"$(W "$BUILD/classes.txt")"

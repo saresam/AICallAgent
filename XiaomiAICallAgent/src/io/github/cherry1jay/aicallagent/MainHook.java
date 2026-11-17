@@ -1,28 +1,18 @@
 package io.github.cherry1jay.aicallagent;
 
+import android.app.AndroidAppHelper;
 import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
-import android.os.Handler;
-import android.os.Looper;
 import android.provider.ContactsContract;
 
-import java.lang.reflect.InvocationHandler;
-import java.lang.reflect.Member;
 import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.FutureTask;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 
-import android.app.AndroidAppHelper;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -30,82 +20,55 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * 接管小米「AI 通话」的对话大脑，并按来电类型分流。
+ * 超级小爱 7.13.35.0012 · AI 通话接管（完整功能版）
  *
- * 实测链路（HyperOS 4.0 / 小爱 8.2.70）：
- *   OsbotInCallService(ASR 分句)
- *     -> CallConversationEngine.handleCallerSentence(String)
- *     -> 原生 LLM -> speakFn(协程 TTS via AudioTrack) -> 写 ai_call_reply_log_content
+ * 真机验证过的链路（Redmi K50 Ultra / HyperOS / 小爱 7.13.35.0012）：
+ *   NlpManager.doNlp(query, type)        query=对方 ASR 文本；auto_answer/user_custom_query 为真实对话
+ *     -> 云端 NLP -> 回复文本
+ *   TtsManager.buildTtsEvent(text)       text=小爱准备播报的回复 ← 替换这里
  *
- * 我们替换 handleCallerSentence：先按黄页标签判定来电类型，命中规则的才接管，
- * 其余原样交给小米原生模型。接管时借引擎的 speakFn 播报，并在播报结束后补发
- * onAgentTurnComplete，保证原生状态机继续正常监听。
+ * 号码来源：InCallAiServiceImpl.h()（public static）返回当前 android.telecom.Call
+ *   Call.getDetails().getHandle().getSchemeSpecificPart() 取号码
+ *
+ * 策略：只替换“播报文本”，不碰状态机 / AudioTrack / 回调。
+ *   doNlp（工作线程）里查来电类型 + 按类型调模型，把回复存进 pendingReply；
+ *   buildTtsEvent 到来时替换参数。分流不命中 / 模型失败 / 无 Key —— 放行原生，通话零中断。
  */
 public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "AICallAgent";
-    private static final String TARGET_PKG = "com.miui.voiceassist";
-    private static final String ENGINE_CLS = "com.aios.osbot.tools.phone.engine.CallConversationEngine";
-    private static final String SERVICE_CLS = "com.aios.osbot.tools.phone.service.OsbotInCallService";
+    private static final String TARGET_PKG = "com.xiaomi.aiasst.service";
+    private static final String NLP_CLS = "com.xiaomi.aiasst.service.aicall.process.nlp.NlpManager";
+    private static final String TTS_CLS = "com.xiaomi.aiasst.service.aicall.process.tts.TtsManager";
+    private static final String INCALL_CLS = "com.xiaomi.aiasst.service.aicall.incall.InCallAiServiceImpl";
+    /** 字幕源头：ProcessManage.notifyPresenterOnNlpBack(String,String,String,CallScreenCommonBean) */
+    private static final String PM_CLS = "com.xiaomi.aiasst.service.aicall.process.ProcessManage";
+    private static final String BEAN_CLS = "com.xiaomi.aiasst.service.aicall.model.CallScreenCommonBean";
     private static final String YELLOW_PAGE_CLS = "miui.yellowpage.YellowPageUtils";
-    private static final String CONFIG_AUTHORITY = "ai-assist-call-config";
-    private static final String KEY_REPLY_LOG = "ai_call_reply_log_content";
-    /** 小爱自己的开场白配置键：就在 playGreeting 里读，写进去即生效 */
+    private static final String CONFIG_AUTHORITY = "com.xiaomi.aiasst.service.aicall.provider";
     private static final String KEY_OPENING_ACQ = "ai_custom_opening_acquaintance";
     private static final String KEY_OPENING_STR = "ai_custom_opening_stranger";
 
-    private static final long SESSION_GAP_MS = 5 * 60 * 1000L;
-    /**
-     * 播报超时不能写死。
-     *
-     * 之前是固定 8 秒：只要模型这一轮回答得长一点（对方滔滔不绝说一大段，
-     * 模型跟着答得多），TTS 还没播完就被判超时、提前补发 onAgentTurnComplete，
-     * 引擎收到「回合结束」就把还没出声的音频掐了——现象就是字幕有、声音没有。
-     * 现在按字数给：中文 TTS 约 4~5 字/秒，每字留 400ms，另加 6 秒启动余量。
-     */
-    private static final long SPEAK_TIMEOUT_BASE_MS = 6 * 1000L;
-    private static final long SPEAK_TIMEOUT_PER_CHAR_MS = 400L;
-    private static final long SPEAK_TIMEOUT_MAX_MS = 60 * 1000L;
-    private static final long CATEGORY_TTL_MS = 10 * 60 * 1000L;
+    /** 当前这轮的回复：字幕(setText)和语音(buildTtsEvent)共享，不立即清空，靠下一轮更新 */
+    private static volatile String sPendingReply = null;
+    private static volatile long sPendingAt = 0L;
+    private static final long REPLY_TTL_MS = 15000L;
 
-    private static ExecutorService sWorker;
-    private static ExecutorService sLogPool;
     private static final Object LOCK = new Object();
     private static final List<LlmClient.Msg> sHistory = new ArrayList<>();
-    private static long sLastTurnAt;
 
-    private static Object sSuspendedSentinel;
-
-    /**
-     * 同时进行中的回合数。
-     *
-     * 对方一口气说很长一段时，引擎的 ASR 会分句多次回调 handleCallerSentence，
-     * 上一轮的 TTS 还没播完就又来一轮，两轮抢同一个播放器就会「字幕有、声音没有」。
-     * 这个计数只用于日志定位。
-     */
-    private static final java.util.concurrent.atomic.AtomicInteger sInflight =
-            new java.util.concurrent.atomic.AtomicInteger();
-
-    /** 当前通话信息，由 OsbotInCallService.onCallAdded 捕获 */
+    /** 当前来电信息 */
     private static volatile String sNumber = "";
     private static volatile String sCallerName = "";
-
-    /**
-     * 这通电话是不是用户手动点「AI 应答 → 小爱帮我回」升级来的。
-     * 手动接管算明确指令，不该再被来电分类开关挡掉。
-     */
-    private static volatile boolean sManualTakeover;
-
-    /** 这通电话是否已经初始化过接管，避免重复回调反复清空对话上下文 */
-    private static volatile boolean sTakeoverInit;
+    private static volatile boolean sManualTakeover = false;
 
     private static final Map<String, Cached> sCategoryCache = new ConcurrentHashMap<>();
+    private static final long CATEGORY_TTL_MS = 10 * 60 * 1000L;
 
     private static final class Cached {
         final String category;
         final String tag;
         final long at;
-
         Cached(String category, String tag) {
             this.category = category;
             this.tag = tag;
@@ -115,277 +78,237 @@ public class MainHook implements IXposedHookLoadPackage {
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
-        if (!TARGET_PKG.equals(lp.packageName)) {
-            return;
-        }
-        log("注入成功：" + lp.packageName + " (" + lp.processName + ")");
+        if (!TARGET_PKG.equals(lp.packageName)) return;
+        log("注入成功（完整版）pkg=" + lp.packageName + " proc=" + lp.processName);
         final ClassLoader cl = lp.classLoader;
 
+        // 1) 抓 ASR 文本 + 查询号码，并生成模型回复
         try {
-            Class<?> serviceCls = XposedHelpers.findClass(SERVICE_CLS, cl);
-            XposedBridge.hookAllMethods(serviceCls, "onCallAdded", new XC_MethodHook() {
+            Class<?> nlp = XposedHelpers.findClass(NLP_CLS, cl);
+            XposedBridge.hookAllMethods(nlp, "doNlp", new XC_MethodHook() {
                 @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    sTakeoverInit = false;
-                    captureCall(param.args);
+                protected void beforeHookedMethod(MethodHookParam p) {
+                    try { onNlp(p, cl); }
+                    catch (Throwable t) { log("doNlp 异常（放行原生）：" + t); }
                 }
             });
-            XposedBridge.hookAllMethods(serviceCls, "onCallRemoved", new XC_MethodHook() {
+            log("hook doNlp 成功");
+        } catch (Throwable e) { log("hook doNlp 失败：" + e); }
+
+        // 2) 替换播报文本（语音）
+        try {
+            Class<?> tts = XposedHelpers.findClass(TTS_CLS, cl);
+            XposedBridge.hookAllMethods(tts, "buildTtsEvent", new XC_MethodHook() {
                 @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    sManualTakeover = false;
-                    sTakeoverInit = false;
-                    resetHistory();
+                protected void beforeHookedMethod(MethodHookParam p) {
+                    try { onBuildTts(p); }
+                    catch (Throwable t) { log("buildTtsEvent 异常（放行原生）：" + t); }
                 }
             });
-        } catch (Throwable t) {
-            log("通话信息钩子失败：" + t);
+            log("hook buildTtsEvent 成功");
+        } catch (Throwable e) { log("hook buildTtsEvent 失败：" + e); }
+
+        // 3) 替换字幕：在 NLP 结果回传界面的源头改 bean.text，让字幕与语音一致
+        try {
+            Class<?> pm = XposedHelpers.findClass(PM_CLS, cl);
+            XposedBridge.hookAllMethods(pm, "notifyPresenterOnNlpBack", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam p) {
+                    try { onNlpBack(p); }
+                    catch (Throwable t) { log("字幕替换异常（放行原生）：" + t); }
+                }
+            });
+            log("hook notifyPresenterOnNlpBack 成功");
+        } catch (Throwable e) { log("hook notifyPresenterOnNlpBack 失败：" + e); }
+    }
+
+    private static boolean isRealDialog(String type, String query) {
+        if (query == null) return false;
+        if (query.startsWith("call_screen") || query.contains("@#") || query.startsWith("stop_")) return false;
+        return "auto_answer".equals(type) || "user_custom_query".equals(type);
+    }
+
+    private void onNlp(XC_MethodHook.MethodHookParam p, ClassLoader cl) {
+        String query = p.args.length > 0 && p.args[0] != null ? String.valueOf(p.args[0]) : "";
+        String type = p.args.length > 1 && p.args[1] != null ? String.valueOf(p.args[1]) : "";
+
+        // 一通新电话的第一句真实对话：抓取号码、写开场白
+        if (isRealDialog(type, query) && (sNumber == null || sNumber.isEmpty())) {
+            captureNumber(cl);
+        }
+        if (!isRealDialog(type, query)) return;
+
+        // user_custom_query = 用户手动触发（小爱帮我回/自定义发言），豁免分类开关
+        boolean isManual = "user_custom_query".equals(type);
+        if (isManual) {
+            sManualTakeover = true;
+            synchronized (LOCK) { sHistory.clear(); }
+            log("手动接管路径(user_custom_query) → 忽略分类开关");
+        }
+        // 新回合：先作废上一轮的替换值，避免残留串到本轮原生播报/字幕
+        synchronized (LOCK) { sPendingReply = null; }
+        log("收到对方话 [" + type + "] " + cut(query));
+
+        Context ctx = AndroidAppHelper.currentApplication();
+        if (ctx == null) { log("拿不到 Context，放行原生"); return; }
+        Config cfg = Config.load(ctx);
+        if (cfg == null || !cfg.enabled) { log("模块已关闭，放行原生"); return; }
+        if (cfg.apiKey == null || cfg.apiKey.trim().isEmpty()) {
+            log("未填 API Key，放行原生"); return;
         }
 
-        try {
-            Class<?> engineCls = XposedHelpers.findClass(ENGINE_CLS, cl);
-            XposedBridge.hookAllMethods(engineCls, "handleCallerSentence", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        onCallerSentence(param, cl);
-                    } catch (Throwable t) {
-                        log("处理回合出错：" + t);
-                    }
-                }
-            });
-            sSuspendedSentinel = resolveSuspendedSentinel(cl);
-            log("Hook 就绪，suspend 哨兵=" + sSuspendedSentinel);
-        } catch (Throwable t) {
-            log("引擎钩子失败：" + t);
+        // 来电分类（黄页标签 + 通讯录 + 短号兜底）
+        String[] ct = resolveCategory(ctx, cl);
+        String category = ct[0], tag = ct[1];
+        boolean manualBypass = (sManualTakeover || isManual) && cfg.manualIgnoreCategory;
+        if (!cfg.shouldHandle(category) && !manualBypass) {
+            log("类型=" + Category.label(category) + "（" + tag + "）→ 走原生");
+            logAsync(ctx, CallLogStore.TYPE_INFO,
+                    "类型【" + Category.label(category) + "】→ 原生" + (tag == null ? "" : "(" + tag + ")"));
+            return;
         }
 
-        // 通话中点右上角「AI 应答 → 小爱帮我回」
-        // 内部会走 takeOverCallWithAi -> createEngine(Call)，与自动接听共用同一个引擎。
+        logAsync(ctx, CallLogStore.TYPE_REMOTE, query);
+        String prompt = cfg.promptFor(category);
+        cfg.timeoutSec = Math.min(cfg.timeoutSec, 3); // 电话里不宜久等
         try {
-            Class<?> svcCls = XposedHelpers.findClass(SERVICE_CLS, cl);
-            java.util.Set<XC_MethodHook.Unhook> unhooks =
-                    XposedBridge.hookAllMethods(svcCls, "takeOverCallWithAi", new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            try {
-                                onManualTakeover(param);
-                            } catch (Throwable t) {
-                                log("处理手动接管出错：" + t);
-                            }
-                        }
-                    });
-            log("手动接管钩子：" + unhooks.size() + " 个方法（0 表示没匹配到，接管会走原生）");
+            long t0 = System.currentTimeMillis();
+            String reply = LlmClient.chat(cfg, snapshotHistory(), query, prompt);
+            long cost = System.currentTimeMillis() - t0;
+            if (reply == null || reply.trim().isEmpty()) {
+                log("模型返回空（" + cost + "ms），放行原生");
+                return;
+            }
+            String clean = stripQuotes(reply.trim());
+            synchronized (LOCK) {
+                sPendingReply = clean;
+                sPendingAt = System.currentTimeMillis();
+            }
+            pushHistory(query, clean, cfg.maxHistory);
+            log("[" + Category.label(category) + "] 模型回复（" + cost + "ms）：" + cut(clean));
+            logAsync(ctx, CallLogStore.TYPE_LOCAL, clean + " ·" + cost + "ms · " + Category.label(category));
         } catch (Throwable t) {
-            log("手动接管钩子失败：" + t);
+            log("模型调用失败，放行原生：" + t);
+            logAsync(ctx, CallLogStore.TYPE_ERROR, "模型失败：" + t);
         }
     }
 
-    // ------------------------------------- 手动「小爱帮我回」
+    /** 语音播报文本替换（不清空，字幕侧也读同一个值） */
+    private void onBuildTts(XC_MethodHook.MethodHookParam p) {
+        if (p.args.length == 0 || !(p.args[0] instanceof String)) return;
+        String original = (String) p.args[0];
+        String ready = currentReply();
+        if (ready != null) {
+            p.args[0] = ready;
+            log("已替换播报文本：" + cut(original) + " -> " + cut(ready));
+        }
+    }
 
     /**
-     * 用户点通话页右上角 AI 应答、选「小爱帮我回」时，系统调
-     * OsbotInCallService.takeOverCallWithAi(Call)，内部 createEngine(Call) 建出
-     * CallConversationEngine —— 和自动接听是同一个引擎，所以对话回合照样落在
-     * handleCallerSentence 上，我们的模型天然能接住。
-     *
-     * 这里只解决两个会让用户觉得"没接上"的问题：
-     *  1) 若这通电话曾被 pauseAiAssist 暂停（通话中开关关过），takeOverCallWithAi 打开头
-     *     第一个 shouldContinueAiAssist("start takeover") 就会中断，表现为点了没反应。
-     *     接管前必须把 isAiAssistPaused 清掉。
-     *  2) 用户主动点按钮 = 明确要 AI 接，不该再被来电分类开关挡回去（默认豁免）。
+     * NLP 结果回传界面：把 bean.text（字幕/记录文本）改成模型回复。
+     * 签名 (String, String, String, CallScreenCommonBean)，bean 在第 4 个参数。
      */
-    private void onManualTakeover(XC_MethodHook.MethodHookParam param) {
-        final Object svc = param.thisObject;
+    private void onNlpBack(XC_MethodHook.MethodHookParam p) {
+        if (p.args.length < 4) return;
+        Object bean = p.args[3];
+        if (bean == null) return;
+        String ready = currentReply();
+        if (ready == null) return;
         try {
-            if (XposedHelpers.getBooleanField(svc, "isAiAssistPaused")) {
-                XposedHelpers.setBooleanField(svc, "isAiAssistPaused", false);
-                log("接管前清掉暂停标记（否则本轮接管会被立刻中断）");
-            }
+            String original = null;
+            try { original = (String) XposedHelpers.callMethod(bean, "getText"); } catch (Throwable ignored) {}
+            XposedHelpers.setObjectField(bean, "text", ready);
+            log("已替换字幕文本：" + cut(original) + " -> " + cut(ready));
         } catch (Throwable t) {
-            log("复位暂停标记失败：" + t);
+            log("字幕字段写入失败：" + t);
         }
-
-        // 同一通电话里 takeOverCallWithAi 会被反复回调（实测一通电话触发七八次），
-        // 每次都重置历史会让多轮对话丢掉上下文，这里按通话去重：每通电话只初始化一次。
-        if (sTakeoverInit) {
-            return;
-        }
-
-        final Context ctx = AndroidAppHelper.currentApplication();
-        if (ctx == null) {
-            sManualTakeover = false;
-            log("手动接管：拿不到 Context，按原生走");
-            return;
-        }
-
-        final Config cfg = Config.load(ctx);
-        sManualTakeover = cfg.enabled && cfg.manualTakeover;
-        resetHistory();
-        writeOpening(ctx, cfg);
-        sTakeoverInit = true;
-
-        log("检测到手动接管（小爱帮我回）→ " + (sManualTakeover ? "本通用大模型" : "仍走原生话术"));
-        logAsync(ctx, CallLogStore.TYPE_INFO,
-                sManualTakeover ? "手动 AI 接管 · 已接入大模型" : "手动 AI 接管 · 使用原生话术");
     }
 
-    /** 新一通电话从零开始，别把上一通的上下文串进来 */
-    private static void resetHistory() {
+    /** 取当前有效回复（TTL 内）。不清空——字幕和语音都要读；靠下一轮 onNlp 开头置 null 作废旧值 */
+    private static String currentReply() {
         synchronized (LOCK) {
-            if (!sHistory.isEmpty()) {
-                log("手动接管，清空上一通对话上下文");
-            }
-            sHistory.clear();
-            sLastTurnAt = 0L;
-        }
-    }
-
-    /**
-     * 开场白走小爱自己的配置键（playGreeting 里读 ai_custom_opening_*）。
-     * 模块里留空表示不干预，保留用户在小爱原生设置里填的值。
-     */
-    private static void writeOpening(Context ctx, Config cfg) {
-        final String acq = cfg.openingAcquaintance == null ? "" : cfg.openingAcquaintance.trim();
-        final String str = cfg.openingStranger == null ? "" : cfg.openingStranger.trim();
-        try {
-            if (!acq.isEmpty()) {
-                putConfig(ctx, KEY_OPENING_ACQ, acq);
-            }
-            if (!str.isEmpty()) {
-                putConfig(ctx, KEY_OPENING_STR, str);
-            }
-            if (!acq.isEmpty() || !str.isEmpty()) {
-                log("已下发自定义开场白");
-            }
-        } catch (Throwable t) {
-            log("写开场白失败：" + t);
-        }
-    }
-
-    private static boolean putConfig(Context ctx, String key, String value) {
-        try {
-            Uri uri = Uri.parse("content://" + CONFIG_AUTHORITY + "/settings/" + key);
-            ContentValues cv = new ContentValues();
-            cv.put("key", key);
-            cv.put("value", value);
-            return ctx.getContentResolver().insert(uri, cv) != null;
-        } catch (Throwable t) {
-            log("写配置失败 " + key + "：" + t);
-            return false;
-        }
-    }
-
-    // ------------------------------------------------------------ 来电信息
-
-    private void captureCall(Object[] args) {
-        try {
-            if (args == null || args.length == 0 || args[0] == null) {
-                return;
-            }
-            Object call = args[0];
-            Object details = XposedHelpers.callMethod(call, "getDetails");
-            if (details == null) {
-                return;
-            }
-            String number = "";
-            Object handle = XposedHelpers.callMethod(details, "getHandle");
-            if (handle instanceof Uri) {
-                String ssp = ((Uri) handle).getSchemeSpecificPart();
-                if (ssp != null) {
-                    number = ssp;
-                }
-            }
-            String name;
-            try {
-                name = (String) XposedHelpers.callMethod(details, "getCallerDisplayName");
-            } catch (Throwable t) {
-                name = null;
-            }
-            sNumber = number;
-            sCallerName = name == null ? "" : name;
-            sCategoryCache.clear();
-            log("来电：" + number + " / " + sCallerName);
-        } catch (Throwable t) {
-            log("解析来电失败：" + t);
-        }
-    }
-
-    /** 查黄页标签并归类，带缓存 */
-    private String[] resolveCategory(Context ctx, ClassLoader cl) {
-        String number = sNumber;
-        if (number == null) {
-            number = "";
-        }
-        Cached c = sCategoryCache.get(number);
-        if (c != null && System.currentTimeMillis() - c.at < CATEGORY_TTL_MS) {
-            return new String[]{c.category, c.tag};
-        }
-
-        String tag = null;
-        try {
-            tag = queryYellowPageTag(ctx, cl, number);
-        } catch (Throwable t) {
-            log("黄页查询异常：" + t);
-        }
-
-        boolean isContact = sCallerName != null && !sCallerName.isEmpty()
-                && !sCallerName.equals(number) && !isPhoneLike(sCallerName);
-
-        // Telecom 的 callerDisplayName 在日常来电里基本都是空的，
-        // 只靠它会把熟人误判成陌生号码、用错场景话术。这里自己查通讯录兜底。
-        if (!isContact) {
-            String contactName = lookupContactName(ctx, number);
-            if (contactName != null && !contactName.isEmpty()) {
-                sCallerName = contactName;
-                isContact = true;
-                log("通讯录匹配到：" + contactName);
-            }
-        }
-
-        String category = Category.classify(tag, isContact, number);
-        log("归类：" + Category.label(category) + "（联系人=" + isContact + "，黄页=" + tag + "）");
-
-        sCategoryCache.put(number, new Cached(category, tag));
-        return new String[]{category, tag};
-    }
-
-    /** 用号码反查通讯录姓名，小爱进程自带 READ_CONTACTS 权限 */
-    private String lookupContactName(Context ctx, String number) {
-        if (number == null || number.isEmpty()) {
-            return null;
-        }
-        Cursor c = null;
-        try {
-            Uri uri = Uri.withAppendedPath(
-                    ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(number));
-            c = ctx.getContentResolver().query(uri,
-                    new String[]{ContactsContract.PhoneLookup.DISPLAY_NAME}, null, null, null);
-            if (c != null && c.moveToFirst()) {
-                return c.getString(0);
-            }
-        } catch (Throwable t) {
-            log("通讯录查询失败：" + t);
-        } finally {
-            if (c != null) {
-                try {
-                    c.close();
-                } catch (Throwable ignored) {
-                }
+            if (sPendingReply != null && System.currentTimeMillis() - sPendingAt < REPLY_TTL_MS) {
+                return sPendingReply;
             }
         }
         return null;
     }
 
-    private String queryYellowPageTag(Context ctx, ClassLoader cl, String number) throws Exception {
-        if (number == null || number.isEmpty()) {
-            return null;
-        }
-        Class<?> yp = Class.forName(YELLOW_PAGE_CLS, false, cl);
-        for (Method m : yp.getMethods()) {
-            if (!"getPhoneInfo".equals(m.getName())) {
-                continue;
+    /** 从 InCallAiServiceImpl.h() 拿当前 Call 的号码 */
+    private void captureNumber(ClassLoader cl) {
+        try {
+            Class<?> incall = XposedHelpers.findClass(INCALL_CLS, cl);
+            Object call = XposedHelpers.callStaticMethod(incall, "h");
+            if (call == null) { log("当前无 Call，号码留空"); return; }
+            Object details = XposedHelpers.callMethod(call, "getDetails");
+            Object handle = XposedHelpers.callMethod(details, "getHandle");
+            String number = "";
+            if (handle instanceof Uri) {
+                String ssp = ((Uri) handle).getSchemeSpecificPart();
+                if (ssp != null) number = ssp;
             }
+            String name = "";
+            try {
+                Object n = XposedHelpers.callMethod(details, "getCallerDisplayName");
+                if (n != null) name = String.valueOf(n);
+            } catch (Throwable ignored) {}
+            sNumber = number == null ? "" : number;
+            sCallerName = name;
+            sCategoryCache.clear();
+            log("来电号码：" + sNumber + " / " + name);
+        } catch (Throwable t) {
+            log("取号码失败（分类按陌生号处理）：" + t);
+            sNumber = "";
+            sCallerName = "";
+        }
+    }
+
+    private String[] resolveCategory(Context ctx, ClassLoader cl) {
+        String number = sNumber == null ? "" : sNumber;
+        Cached c = sCategoryCache.get(number);
+        if (c != null && System.currentTimeMillis() - c.at < CATEGORY_TTL_MS) {
+            return new String[]{c.category, c.tag};
+        }
+        String tag = null;
+        try { tag = queryYellowPageTag(ctx, cl, number); }
+        catch (Throwable t) { log("黄页查询异常：" + t); }
+
+        boolean isContact = sCallerName != null && !sCallerName.isEmpty()
+                && !sCallerName.equals(number) && !isPhoneLike(sCallerName);
+        if (!isContact) {
+            String cn = lookupContactName(ctx, number);
+            if (cn != null && !cn.isEmpty()) { sCallerName = cn; isContact = true; }
+        }
+        String category = Category.classify(tag, isContact, number);
+        log("归类：" + Category.label(category) + "（联系人=" + isContact + "，黄页=" + tag + "）");
+        sCategoryCache.put(number, new Cached(category, tag));
+        return new String[]{category, tag};
+    }
+
+    private String lookupContactName(Context ctx, String number) {
+        if (number == null || number.isEmpty()) return null;
+        Cursor c = null;
+        try {
+            Uri uri = Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(number));
+            c = ctx.getContentResolver().query(uri,
+                    new String[]{ContactsContract.PhoneLookup.DISPLAY_NAME}, null, null, null);
+            if (c != null && c.moveToFirst()) return c.getString(0);
+        } catch (Throwable t) {
+            log("通讯录查询失败：" + t);
+        } finally {
+            if (c != null) try { c.close(); } catch (Throwable ignored) {}
+        }
+        return null;
+    }
+
+    /** 黄页标签：优先用目标进程 classLoader，兜底用系统 ClassLoader */
+    private String queryYellowPageTag(Context ctx, ClassLoader cl, String number) throws Exception {
+        if (number == null || number.isEmpty()) return null;
+        Class<?> yp = null;
+        try { yp = Class.forName(YELLOW_PAGE_CLS, false, cl); }
+        catch (Throwable t) { yp = Class.forName(YELLOW_PAGE_CLS); }
+        for (Method m : yp.getMethods()) {
+            if (!"getPhoneInfo".equals(m.getName())) continue;
             Class<?>[] ps = m.getParameterTypes();
             if (ps.length == 3 && ps[0].isAssignableFrom(ctx.getClass()) && ps[1] == String.class) {
                 Object third = (ps[2] == boolean.class || ps[2] == Boolean.class) ? Boolean.TRUE : (Object) 1;
@@ -400,358 +323,69 @@ public class MainHook implements IXposedHookLoadPackage {
         return null;
     }
 
-    // ------------------------------------------------------------ 主流程
-
-    private void onCallerSentence(XC_MethodHook.MethodHookParam param, ClassLoader cl) {
-        final Context ctx = AndroidAppHelper.currentApplication();
-        if (ctx == null) {
-            log("拿不到 Context，放行原生");
-            return;
-        }
-
-        final Config cfg = Config.load(ctx);
-        if (!cfg.enabled) {
-            log("模块已关闭，走原生回复");
-            return;
-        }
-        if (cfg.apiKey == null || cfg.apiKey.trim().isEmpty()) {
-            log("未填写 API Key，走原生回复");
-            return;
-        }
-
-        final String sentence = String.valueOf(param.args[0]);
-        if (sentence.trim().isEmpty()) {
-            return;
-        }
-
-        final Object engine = param.thisObject;
-        final Member originalMethod = param.method;
-        final Object[] originalArgs = param.args;
-
-        // 先把这一回合拦下，避免原生模型也说话（重了会串音）
-        param.setResult(null);
-        int inflight = sInflight.incrementAndGet();
-        log("回合#" + inflight + " 收到对方语句（" + sentence.length() + " 字）"
-                + (inflight > 1 ? " ⚠ 上一轮还没收尾" : "")
-                + "：" + (sentence.length() > 60 ? sentence.substring(0, 60) + "…" : sentence));
-        logAsync(ctx, CallLogStore.TYPE_REMOTE, sentence);
-
-        // 看门狗：回合已经被我们拦下，任何一环卡死都必须由我们补一句话推进状态机，
-        // 否则界面会永久停在「AI 自动回复中」。
-        final AtomicBoolean turnDone = new AtomicBoolean(false);
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            if (!turnDone.get()) {
-                log("本轮 15 秒未收尾，强制播报兜底");
-                speakAndFinish(engine, "不好意思，我这边有点卡，稍后让机主回你电话好吗？");
-            }
-        }, 15 * 1000L);
-
-        worker().execute(() -> {
-            try {
-                final long t0 = System.currentTimeMillis();
-                final Turn turn = new Turn();
-
-            // 整轮（分类 + 模型）都放到子线程里跑，并加硬超时。
-            // 之前这里是裸调用，一旦 DNS 解析或通讯录查询卡住，
-            // 原生回合已被 setResult(null) 拦下，通话就会一直卡在「AI 自动回复中」。
-            FutureTask<Void> task = new FutureTask<>(() -> {
-                String[] ct = resolveCategory(ctx, cl);
-                turn.category = ct[0];
-                turn.tag = ct[1];
-                turn.label = Category.label(turn.category);
-
-                boolean manualBypass = sManualTakeover && cfg.manualIgnoreCategory;
-                if (!cfg.shouldHandle(turn.category) && !manualBypass) {
-                    turn.toNative = true;
-                    return null;
-                }
-                if (manualBypass && !cfg.shouldHandle(turn.category)) {
-                    log("来电类型=" + turn.label + " 本应走原生，但用户手动接管，改用大模型");
-                }
-                turn.reply = LlmClient.chat(cfg, snapshotHistory(t0), sentence,
-                        cfg.promptFor(turn.category));
-                log("模型原始：" + LlmClient.lastDebug);
-                return null;
-            });
-            Thread th = new Thread(task, "aicall-agent-turn");
-            th.setDaemon(true);
-            th.start();
-            try {
-                // 通话里静默超过十秒对方就会以为断线，所以整轮硬上限压到 9 秒
-                task.get(9, TimeUnit.SECONDS);
-            } catch (Throwable t) {
-                turn.error = t;
-                task.cancel(true);
-            }
-
-            if (turn.toNative) {
-                log("来电类型=" + turn.label + "（标签：" + turn.tag + "），按设置交回原生");
-                logAsync(ctx, CallLogStore.TYPE_INFO,
-                        "来电类型【" + turn.label + "】→ 走小米原生"
-                                + (turn.tag == null ? "" : "（标签：" + turn.tag + "）"));
-                fallbackToNative(originalMethod, engine, originalArgs);
-                return;
-            }
-
-            long cost = System.currentTimeMillis() - t0;
-            if (turn.reply == null) {
-                String why = turn.error == null ? "模型返回空" : String.valueOf(turn.error);
-                log("模型调用失败（" + cost + "ms）：" + why);
-                logAsync(ctx, CallLogStore.TYPE_ERROR, "模型失败：" + why);
-                // 已经把原生回合拦掉了，这里必须自己说一句把状态机推下去，否则会卡住
-                speakAndFinish(engine, "不好意思，这边信号不太好，我记一下，稍后让机主回你电话好吗？");
-                return;
-            }
-
-            log("[" + turn.label + "] 回复(" + cost + "ms)：" + turn.reply);
-            logAsync(ctx, CallLogStore.TYPE_LOCAL,
-                    turn.reply + "  ·" + cost + "ms · " + turn.label);
-            pushHistory(sentence, turn.reply, cfg.maxHistory);
-
-            writeReplyLog(ctx, turn.reply);
-            speakAndFinish(engine, turn.reply);
-            } finally {
-                turnDone.set(true);
-                sInflight.decrementAndGet();
-            }
-        });
-    }
-
-    /** 一轮处理的结果容器 */
-    private static final class Turn {
-        String category;
-        String tag;
-        String label;
-        String reply;
-        Throwable error;
-        boolean toNative;
-    }
-
-    private void fallbackToNative(Member originalMethod, Object engine, Object[] args) {
+    private static void writeOpening(Context ctx, Config cfg) {
+        if (cfg == null) return;
         try {
-            XposedBridge.invokeOriginalMethod(originalMethod, engine, args);
-        } catch (Throwable t) {
-            log("回落原生失败：" + t);
-        }
+            String acq = cfg.openingAcquaintance == null ? "" : cfg.openingAcquaintance.trim();
+            String str = cfg.openingStranger == null ? "" : cfg.openingStranger.trim();
+            if (!acq.isEmpty()) putConfig(ctx, KEY_OPENING_ACQ, acq);
+            if (!str.isEmpty()) putConfig(ctx, KEY_OPENING_STR, str);
+        } catch (Throwable t) { log("写开场白失败：" + t); }
     }
 
-    /**
-     * 按文本长度估算播报超时，见 SPEAK_TIMEOUT_* 的注释。
-     */
-    private static long speakTimeoutMs(String text) {
-        int n = text == null ? 0 : text.length();
-        long ms = SPEAK_TIMEOUT_BASE_MS + n * SPEAK_TIMEOUT_PER_CHAR_MS;
-        return Math.min(ms, SPEAK_TIMEOUT_MAX_MS);
-    }
-
-    /** 补发回合结束信号，把引擎状态机推下去 */
-    private static void fireTurnComplete(Object engine) {
+    private static boolean putConfig(Context ctx, String key, String value) {
         try {
-            Object cb = XposedHelpers.getObjectField(engine, "onAgentTurnComplete");
-            if (cb != null) {
-                XposedHelpers.callMethod(cb, "invoke");
-                log("回合结束信号已补发");
-            }
-        } catch (Throwable t) {
-            log("补发回合结束失败：" + t);
-        }
+            Uri uri = Uri.parse("content://" + CONFIG_AUTHORITY + "/settings/" + key);
+            ContentValues cv = new ContentValues();
+            cv.put("key", key);
+            cv.put("value", value);
+            return ctx.getContentResolver().insert(uri, cv) != null;
+        } catch (Throwable t) { log("写配置失败 " + key + "：" + t); return false; }
     }
 
-    /**
-     * 借用引擎自己的 speakFn 播报，播报完成后补发 onAgentTurnComplete。
-     */
-    private void speakAndFinish(final Object engine, final String text) {
-        final AtomicBoolean finished = new AtomicBoolean(false);
-        final Handler main = new Handler(Looper.getMainLooper());
-        final long t0 = System.currentTimeMillis();
-        final int len = text == null ? 0 : text.length();
-        final long timeout = speakTimeoutMs(text);
-
-        Runnable completeTurn = () -> {
-            if (!finished.compareAndSet(false, true)) {
-                return;
-            }
-            fireTurnComplete(engine);
-        };
-
-        Runnable forceTurn = () -> {
-            if (!finished.compareAndSet(false, true)) {
-                return;
-            }
-            log("播报超时（" + timeout + "ms，文本 " + len + " 字），强制收尾");
-            fireTurnComplete(engine);
-        };
-
-        try {
-            Object speakFn = XposedHelpers.getObjectField(engine, "speakFn");
-            if (speakFn == null) {
-                log("speakFn 为空，跳过播报");
-                completeTurn.run();
-                return;
-            }
-            log("开始播报（" + len + " 字，超时预算 " + timeout + "ms）");
-            Object continuation = newContinuation(speakFn.getClass().getClassLoader(),
-                    "TTS", () -> {
-                        log("播报完成（" + (System.currentTimeMillis() - t0) + "ms）");
-                        main.post(completeTurn);
-                    });
-            Object ret = XposedHelpers.callMethod(speakFn, "invoke", text, continuation);
-            if (ret != sSuspendedSentinel) {
-                log("播报同步返回，直接收尾");
-                completeTurn.run();
-            } else {
-                main.postDelayed(forceTurn, timeout);
-            }
-        } catch (Throwable t) {
-            log("播报失败：" + t);
-            completeTurn.run();
-        }
+    private static void logAsync(final Context ctx, final String type, final String text) {
+        if (ctx == null) return;
+        new Thread(() -> {
+            try { LogProvider.appendFromHook(ctx, type, text); }
+            catch (Throwable ignored) {}
+        }, "aicall-log").start();
     }
 
-    // ------------------------------------------------------------ 工具
-
-    /**
-     * 跨进程写通话日志一律走独立线程。
-     *
-     * 之前这里是同步 ContentResolver.call：一旦模块进程被回收或正在重启，
-     * 这个调用会把引擎的 hook 线程（也就是通话线程）一起卡住，
-     * 表现就是界面停在「AI 自动回复中」再也不动。
-     */
-    private static void logAsync(Context ctx, String type, String text) {
-        if (ctx == null) {
-            return;
-        }
-        final Context app;
-        try {
-            Context c = ctx.getApplicationContext();
-            app = c != null ? c : ctx;
-        } catch (Throwable t) {
-            return;
-        }
-        try {
-            logPool().execute(() -> LogProvider.appendFromHook(app, type, text));
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static ExecutorService logPool() {        synchronized (LOCK) {
-            if (sLogPool == null) {
-                sLogPool = Executors.newSingleThreadExecutor(r -> {
-                    Thread t = new Thread(r, "aicall-agent-log");
-                    t.setDaemon(true);
-                    return t;
-                });
-            }
-            return sLogPool;
-        }
-    }
-
-    private static ExecutorService worker() {
-        synchronized (LOCK) {
-            if (sWorker == null) {
-                sWorker = Executors.newSingleThreadExecutor(r -> {
-                    Thread t = new Thread(r, "aicall-agent-worker");
-                    t.setDaemon(true);
-                    return t;
-                });
-            }
-            return sWorker;
-        }
-    }
-
-    private static List<LlmClient.Msg> snapshotHistory(long now) {
-        synchronized (LOCK) {
-            if (now - sLastTurnAt > SESSION_GAP_MS) {
-                if (!sHistory.isEmpty()) {
-                    log("距上次对话较久，清空上下文");
-                }
-                sHistory.clear();
-            }
-            return new ArrayList<>(sHistory);
-        }
+    private static List<LlmClient.Msg> snapshotHistory() {
+        synchronized (LOCK) { return new ArrayList<>(sHistory); }
     }
 
     private static void pushHistory(String user, String assistant, int maxKeep) {
         synchronized (LOCK) {
-            sLastTurnAt = System.currentTimeMillis();
             sHistory.add(new LlmClient.Msg("user", user));
             sHistory.add(new LlmClient.Msg("assistant", assistant));
-            while (sHistory.size() > Math.max(2, maxKeep)) {
-                sHistory.remove(0);
-            }
+            while (sHistory.size() > Math.max(2, maxKeep)) sHistory.remove(0);
         }
     }
 
-    private static void writeReplyLog(Context ctx, String text) {
-        try {
-            Uri uri = Uri.parse("content://" + CONFIG_AUTHORITY + "/settings/" + KEY_REPLY_LOG);
-            ContentValues cv = new ContentValues();
-            cv.put("key", KEY_REPLY_LOG);
-            cv.put("value", text);
-            ctx.getContentResolver().insert(uri, cv);
-        } catch (Throwable t) {
-            log("写字幕失败：" + t);
+    private static String stripQuotes(String s) {
+        if (s == null) return s;
+        String r = s.trim();
+        if (r.length() >= 2) {
+            char a = r.charAt(0), b = r.charAt(r.length() - 1);
+            if ((a == '"' && b == '"') || (a == '“' && b == '”')
+                    || (a == '\'' && b == '\'') || (a == '「' && b == '」')) {
+                r = r.substring(1, r.length() - 1).trim();
+            }
         }
-    }
-
-    private static Object newContinuation(ClassLoader cl, final String tag, final Runnable onResume) throws Exception {
-        Class<?> contCls = Class.forName("kotlin.coroutines.Continuation", false, cl);
-        final Object emptyCtx;
-        try {
-            Class<?> eccCls = Class.forName("kotlin.coroutines.EmptyCoroutineContext", false, cl);
-            emptyCtx = eccCls.getField("INSTANCE").get(null);
-        } catch (Throwable t) {
-            throw new IllegalStateException("找不到 EmptyCoroutineContext", t);
-        }
-        InvocationHandler h = (proxy, method, args) -> {
-            String name = method.getName();
-            if ("getContext".equals(name)) {
-                return emptyCtx;
-            }
-            if ("resumeWith".equals(name)) {
-                // 协程里抛异常也会走到这里，参数是 Result.failure。
-                // 以前直接当成功，TTS 内部报错就被当成「播报完成」吞掉了。
-                String r = (args != null && args.length > 0) ? String.valueOf(args[0]) : "null";
-                if (r != null && r.startsWith("Failure")) {
-                    log(tag + " 挂起体抛异常：" + r);
-                }
-                if (onResume != null) {
-                    onResume.run();
-                }
-                return null;
-            }
-            if ("toString".equals(name)) {
-                return "AICallAgent-Continuation";
-            }
-            if ("hashCode".equals(name)) {
-                return System.identityHashCode(proxy);
-            }
-            if ("equals".equals(name)) {
-                return proxy == (args == null ? null : args[0]);
-            }
-            return null;
-        };
-        return Proxy.newProxyInstance(contCls.getClassLoader(), new Class<?>[]{contCls}, h);
-    }
-
-    private static Object resolveSuspendedSentinel(ClassLoader cl) {
-        try {
-            Class<?> k = Class.forName("kotlin.coroutines.intrinsics.IntrinsicsKt", false, cl);
-            for (Method m : k.getMethods()) {
-                if ("getCOROUTINE_SUSPENDED".equals(m.getName())) {
-                    return m.invoke(null);
-                }
-            }
-        } catch (Throwable ignored) {
-        }
-        return new Object();
+        return r;
     }
 
     private static boolean isPhoneLike(String s) {
-        return s.matches("[+0-9\\-\\s()]{5,}");
+        return s != null && s.matches("[+0-9\\-\\s()]{5,}");
     }
 
-    private static void log(String msg) {
-        XposedBridge.log(TAG + ": " + msg);
+    private static String cut(String s) {
+        if (s == null) return "<null>";
+        return s.length() > 80 ? s.substring(0, 80) + "…(" + s.length() + "字)" : s;
+    }
+
+    private static void log(String s) {
+        XposedBridge.log(TAG + ": " + s);
     }
 }
