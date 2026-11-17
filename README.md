@@ -34,7 +34,7 @@
 
 实测比对：
 
-| 原版（8.2.70） | 旧版ai通话（6.1.6） |
+| 超级小爱（8.2.70） | 超级小爱（7.13） |
 |---|---|
 | 包名 `com.miui.voiceassist` | AI 通话引擎迁到 **`com.xiaomi.aiasst.service`** |
 | `com.aios.osbot.tools.phone.engine.CallConversationEngine` | ❌ 不存在（无 `osbot` 包） |
