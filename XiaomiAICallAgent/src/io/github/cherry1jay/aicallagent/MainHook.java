@@ -122,28 +122,41 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable e) { log("hook notifyPresenterOnNlpBack 失败：" + e); }
     }
 
+    /**
+     * 只处理“对方真的在说话”的回合。
+     *
+     * auto_answer       = 对方 ASR 出文本，这是真正的对话，要接管。
+     * user_custom_query = 开场白请求（Prologue.getStartText），不是对方说话：
+     *                     系统拿它去云端生成开场白。若在这里接管，会顶掉原生开场白，
+     *                     表现为“AI 抢在对方前面说、且第一句重复两三个字”。必顶放行。
+     */
     private static boolean isRealDialog(String type, String query) {
         if (query == null) return false;
         if (query.startsWith("call_screen") || query.contains("@#") || query.startsWith("stop_")) return false;
-        return "auto_answer".equals(type) || "user_custom_query".equals(type);
+        return "auto_answer".equals(type);
     }
 
     private void onNlp(XC_MethodHook.MethodHookParam p, ClassLoader cl) {
         String query = p.args.length > 0 && p.args[0] != null ? String.valueOf(p.args[0]) : "";
         String type = p.args.length > 1 && p.args[1] != null ? String.valueOf(p.args[1]) : "";
 
-        // 一通新电话的第一句真实对话：抓取号码、写开场白
+        // 一通新电话的第一句真实对话：抓号码 + 下发开场白配置（每通只做一次）
         if (isRealDialog(type, query) && (sNumber == null || sNumber.isEmpty())) {
             captureNumber(cl);
+            sManualTakeover = false;
+            Context c0 = AndroidAppHelper.currentApplication();
+            if (c0 != null) {
+                writeOpening(c0, Config.load(c0));
+            }
         }
-        if (!isRealDialog(type, query)) return;
-
-        // user_custom_query = 用户手动触发（小爱帮我回/自定义发言），豁免分类开关
-        boolean isManual = "user_custom_query".equals(type);
-        if (isManual) {
-            sManualTakeover = true;
-            synchronized (LOCK) { sHistory.clear(); }
-            log("手动接管路径(user_custom_query) → 忽略分类开关");
+        if (!isRealDialog(type, query)) {
+            if ("user_custom_query".equals(type)) {
+                // 开场白请求：原样交给小爱云端生成原生开场白，不接管
+                // 清掉上一轮可能还没被消费的替换值，否则会顶掉开场白
+                synchronized (LOCK) { sPendingReply = null; }
+                log("开场白请求（user_custom_query）→ 放行原生，原文：" + cut(query));
+            }
+            return;
         }
         // 新回合：先作废上一轮的替换值，避免残留串到本轮原生播报/字幕
         synchronized (LOCK) { sPendingReply = null; }
@@ -160,7 +173,7 @@ public class MainHook implements IXposedHookLoadPackage {
         // 来电分类（黄页标签 + 通讯录 + 短号兜底）
         String[] ct = resolveCategory(ctx, cl);
         String category = ct[0], tag = ct[1];
-        boolean manualBypass = (sManualTakeover || isManual) && cfg.manualIgnoreCategory;
+        boolean manualBypass = sManualTakeover && cfg.manualIgnoreCategory;
         if (!cfg.shouldHandle(category) && !manualBypass) {
             log("类型=" + Category.label(category) + "（" + tag + "）→ 走原生");
             logAsync(ctx, CallLogStore.TYPE_INFO,
