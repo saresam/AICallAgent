@@ -49,10 +49,15 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String KEY_OPENING_ACQ = "ai_custom_opening_acquaintance";
     private static final String KEY_OPENING_STR = "ai_custom_opening_stranger";
 
-    /** 当前这轮的回复：字幕(setText)和语音(buildTtsEvent)共享，不立即清空，靠下一轮更新 */
+    /** 当前这轮的回复：字幕(setText)和语音(buildTtsEvent)共享 */
     private static volatile String sPendingReply = null;
     private static volatile long sPendingAt = 0L;
     private static final long REPLY_TTL_MS = 15000L;
+    /** 语音侧已消费标记：buildTtsEvent 对同一轮会调多次（原生一次+缓存一次），只替换第一次 */
+    private static volatile boolean sTtsConsumed = false;
+    /** 字幕侧去重：同一个 bean 文本短时间内重复写入只替换一次 */
+    private static volatile String sLastSubtitleText = null;
+    private static volatile long sLastSubtitleAt = 0L;
 
     private static final Object LOCK = new Object();
     private static final List<LlmClient.Msg> sHistory = new ArrayList<>();
@@ -159,7 +164,10 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
         // 新回合：先作废上一轮的替换值，避免残留串到本轮原生播报/字幕
-        synchronized (LOCK) { sPendingReply = null; }
+        synchronized (LOCK) {
+            sPendingReply = null;
+            sTtsConsumed = false;
+        }
         log("收到对方话 [" + type + "] " + cut(query));
 
         Context ctx = AndroidAppHelper.currentApplication();
@@ -206,20 +214,25 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** 语音播报文本替换（不清空，字幕侧也读同一个值） */
+    /** 语音播报文本替换：同一轮只替换第一次（buildTtsEvent 会被调多次） */
     private void onBuildTts(XC_MethodHook.MethodHookParam p) {
         if (p.args.length == 0 || !(p.args[0] instanceof String)) return;
         String original = (String) p.args[0];
-        String ready = currentReply();
-        if (ready != null) {
-            p.args[0] = ready;
-            log("已替换播报文本：" + cut(original) + " -> " + cut(ready));
+        synchronized (LOCK) {
+            if (sTtsConsumed) {
+                log("播报重复调用，放行（原文：" + cut(original) + "）");
+                return;
+            }
+            if (sPendingReply == null || System.currentTimeMillis() - sPendingAt >= REPLY_TTL_MS) return;
+            sTtsConsumed = true;   // 消费掉，后续同轮调用不再替换
+            p.args[0] = sPendingReply;
+            log("已替换播报文本：" + cut(original) + " -> " + cut(sPendingReply));
         }
     }
 
     /**
      * NLP 结果回传界面：把 bean.text（字幕/记录文本）改成模型回复。
-     * 签名 (String, String, String, CallScreenCommonBean)，bean 在第 4 个参数。
+     * 同一段原文 800ms 内重复写入只替换一次，防止字幕重复。
      */
     private void onNlpBack(XC_MethodHook.MethodHookParam p) {
         if (p.args.length < 4) return;
@@ -230,6 +243,16 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             String original = null;
             try { original = (String) XposedHelpers.callMethod(bean, "getText"); } catch (Throwable ignored) {}
+            String key = original == null ? "" : original;
+            long now = System.currentTimeMillis();
+            synchronized (LOCK) {
+                if (key.equals(sLastSubtitleText) && now - sLastSubtitleAt < 800L) {
+                    log("字幕重复写入，跳过：" + cut(original));
+                    return;
+                }
+                sLastSubtitleText = key;
+                sLastSubtitleAt = now;
+            }
             XposedHelpers.setObjectField(bean, "text", ready);
             log("已替换字幕文本：" + cut(original) + " -> " + cut(ready));
         } catch (Throwable t) {
@@ -237,7 +260,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** 取当前有效回复（TTL 内）。不清空——字幕和语音都要读；靠下一轮 onNlp 开头置 null 作废旧值 */
+    /** 取当前有效回复（TTL 内） */
     private static String currentReply() {
         synchronized (LOCK) {
             if (sPendingReply != null && System.currentTimeMillis() - sPendingAt < REPLY_TTL_MS) {
